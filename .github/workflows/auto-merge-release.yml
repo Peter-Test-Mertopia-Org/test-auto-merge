@@ -132,6 +132,7 @@ jobs:
         if: failure()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             const targetBranch = '${{ matrix.target-branch }}';
             const sourceBranch = '${{ needs.calculate-targets.outputs.source-branch }}';
