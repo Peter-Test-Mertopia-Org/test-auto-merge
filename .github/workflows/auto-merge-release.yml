@@ -1,0 +1,235 @@
+name: Auto Merge Release Branch
+
+on:
+  push:
+    branches:
+      - "release/v*"
+
+# 設定 GITHUB_TOKEN 權限
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # 第一個 job：計算需要合併的目標分支
+  calculate-targets:
+    runs-on: ubuntu-latest
+    # 跳過由 GitHub Actions bot 觸發的 push，避免巢狀觸發
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      target-branches: ${{ steps.get-targets.outputs.branches }}
+      source-branch: ${{ steps.get-targets.outputs.source }}
+      has-targets: ${{ steps.get-targets.outputs.has_targets }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate target branches
+        id: get-targets
+        run: |
+          # 取得觸發的分支名稱 (例如: release/v0.146)
+          SOURCE_BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "source=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+          echo "Source branch: $SOURCE_BRANCH"
+
+          # 解析版本號 (例如: 0.146 -> major=0, minor=146)
+          VERSION=$(echo "$SOURCE_BRANCH" | sed 's/release\/v//')
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          echo "Current version: $MAJOR.$MINOR"
+
+          # 取得所有 remote release 分支
+          git fetch origin
+          ALL_RELEASES=$(git branch -r | grep 'origin/release/v' | sed 's/origin\///' | tr -d ' ')
+
+          # 找出版本號比當前分支更高的 release 分支
+          HIGHER_RELEASES=""
+          for BRANCH in $ALL_RELEASES; do
+            BRANCH_VERSION=$(echo "$BRANCH" | sed 's/release\/v//')
+            BRANCH_MAJOR=$(echo "$BRANCH_VERSION" | cut -d. -f1)
+            BRANCH_MINOR=$(echo "$BRANCH_VERSION" | cut -d. -f2)
+
+            # 比較版本號
+            if [ "$BRANCH_MAJOR" -gt "$MAJOR" ] 2>/dev/null || \
+               ([ "$BRANCH_MAJOR" -eq "$MAJOR" ] && [ "$BRANCH_MINOR" -gt "$MINOR" ] 2>/dev/null); then
+              HIGHER_RELEASES="$HIGHER_RELEASES $BRANCH"
+              echo "Found higher version: $BRANCH"
+            fi
+          done
+
+          # 組合目標分支列表 (develop + 更高版本的 release)
+          # 檢查 develop 分支是否存在
+          if git show-ref --verify --quiet refs/remotes/origin/develop; then
+            TARGETS="develop"
+          else
+            TARGETS=""
+          fi
+
+          for BRANCH in $HIGHER_RELEASES; do
+            if [ -n "$TARGETS" ]; then
+              TARGETS="$TARGETS,$BRANCH"
+            else
+              TARGETS="$BRANCH"
+            fi
+          done
+
+          echo "Target branches: $TARGETS"
+
+          # 轉換為 JSON array 格式
+          if [ -n "$TARGETS" ]; then
+            JSON_ARRAY=$(echo "$TARGETS" | tr ',' '\n' | jq -R . | jq -s -c .)
+            echo "branches=$JSON_ARRAY" >> $GITHUB_OUTPUT
+            echo "has_targets=true" >> $GITHUB_OUTPUT
+          else
+            echo "branches=[]" >> $GITHUB_OUTPUT
+            echo "has_targets=false" >> $GITHUB_OUTPUT
+          fi
+
+  # 第二個 job：執行合併
+  merge-to-branches:
+    needs: calculate-targets
+    if: needs.calculate-targets.outputs.has-targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target-branch: ${{ fromJson(needs.calculate-targets.outputs.target-branches) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge ${{ needs.calculate-targets.outputs.source-branch }} to ${{ matrix.target-branch }}
+        run: |
+          SOURCE_BRANCH="${{ needs.calculate-targets.outputs.source-branch }}"
+          TARGET_BRANCH="${{ matrix.target-branch }}"
+
+          echo "Fetching all branches..."
+          git fetch origin
+
+          echo "Checking out $TARGET_BRANCH..."
+          git checkout "$TARGET_BRANCH"
+
+          echo "Merging $SOURCE_BRANCH into $TARGET_BRANCH..."
+          git merge "origin/$SOURCE_BRANCH" --no-edit
+
+          echo "Pushing changes to $TARGET_BRANCH..."
+          git push origin "$TARGET_BRANCH"
+
+      - name: Create PR on merge conflict
+        id: create-pr
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const targetBranch = '${{ matrix.target-branch }}';
+            const sourceBranch = '${{ needs.calculate-targets.outputs.source-branch }}';
+
+            // Check if PR already exists
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${sourceBranch}`,
+              base: targetBranch,
+              state: 'open'
+            });
+
+            if (existingPRs.length > 0) {
+              console.log(`PR already exists: ${existingPRs[0].html_url}`);
+              core.setOutput('pr_url', existingPRs[0].html_url);
+              core.setOutput('pr_existed', 'true');
+              return;
+            }
+
+            // Create new PR
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔀 Merge ${sourceBranch} into ${targetBranch}`,
+              head: sourceBranch,
+              base: targetBranch,
+              body: `## Auto-merge failed due to conflicts\n\nThis PR was automatically created because the auto-merge from \`${sourceBranch}\` to \`${targetBranch}\` failed.\n\nPlease resolve the conflicts manually and merge this PR.\n\n---\n🤖 Created by GitHub Actions`
+            });
+
+            console.log(`Created PR: ${pr.html_url}`);
+            core.setOutput('pr_url', pr.html_url);
+            core.setOutput('pr_existed', 'false');
+
+      - name: Notify Google Chat on merge conflict
+        if: failure()
+        run: |
+          SOURCE_BRANCH="${{ needs.calculate-targets.outputs.source-branch }}"
+          TARGET_BRANCH="${{ matrix.target-branch }}"
+          PR_URL="${{ steps.create-pr.outputs.pr_url }}"
+          PR_EXISTED="${{ steps.create-pr.outputs.pr_existed }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # 根據 PR 建立狀態設定標題和按鈕
+          if [ -n "$PR_URL" ]; then
+            if [ "$PR_EXISTED" = "true" ]; then
+              TITLE="⚠️ Auto-merge 仍有衝突待處理"
+              PR_TEXT="PR 已存在"
+            else
+              TITLE="🚨 Auto-merge 失敗 - 已建立 PR"
+              PR_TEXT="已建立 PR"
+            fi
+            # 有 PR URL 時顯示 PR 按鈕
+            BUTTONS='[{"text": "查看 PR", "onClick": {"openLink": {"url": "'"${PR_URL}"'"}}}, {"text": "查看 Workflow", "onClick": {"openLink": {"url": "'"${RUN_URL}"'"}}}]'
+            PR_WIDGET='{"decoratedText": {"topLabel": "'"${PR_TEXT}"'", "text": "'"${PR_URL}"'"}},'
+          else
+            TITLE="🚨 Auto-merge 失敗 - 需要手動處理"
+            PR_TEXT="無法建立 PR（權限不足）"
+            # 沒有 PR URL 時只顯示 Workflow 按鈕
+            BUTTONS='[{"text": "查看 Workflow", "onClick": {"openLink": {"url": "'"${RUN_URL}"'"}}}]'
+            PR_WIDGET='{"decoratedText": {"topLabel": "狀態", "text": "'"${PR_TEXT}"'"}},'
+          fi
+
+          curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d @- << EOF
+          {
+            "cardsV2": [{
+              "cardId": "merge-conflict-card",
+              "card": {
+                "header": {
+                  "title": "${TITLE}",
+                  "subtitle": "${REPO}"
+                },
+                "sections": [{
+                  "widgets": [
+                    {
+                      "decoratedText": {
+                        "topLabel": "來源分支",
+                        "text": "${SOURCE_BRANCH}"
+                      }
+                    },
+                    {
+                      "decoratedText": {
+                        "topLabel": "目標分支",
+                        "text": "${TARGET_BRANCH}"
+                      }
+                    },
+                    ${PR_WIDGET}
+                    {
+                      "buttonList": {
+                        "buttons": ${BUTTONS}
+                      }
+                    }
+                  ]
+                }]
+              }
+            }]
+          }
+          EOF
